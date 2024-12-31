@@ -5,7 +5,7 @@
 APG Builder and Validator
 Created: 2024-12-31 11:39:59 UTC
 Author: AnmiTaliDev
-License: MIT
+License: GPL
 
 Utility for building and validating APG packages using PyATA library.
 """

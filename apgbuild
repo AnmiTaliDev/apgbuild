@@ -1,233 +1,232 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-APG Builder and Validator
-Created: 2024-12-31 11:39:59 UTC
-Author: AnmiTaliDev
-License: GPL
-
-Utility for building and validating APG packages using PyATA library.
-"""
 
 import os
 import sys
 import json
+import tarfile
+import argparse
 import shutil
-import hashlib
-import logging
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union
-import click
-from pyata import ATAArchive
+from datetime import datetime
+from typing import Dict, Any
+import colorama
+from colorama import Fore, Back, Style
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger('apgbuild')
+# Initialize colorama for cross-platform colored output
+colorama.init(autoreset=True)
 
-class APGError(Exception):
-    """Базовый класс для ошибок APG"""
-    pass
+VERSION = "1.0.0"
+BANNER = f"""
+{Fore.CYAN}╔══════════════════════════════════════════╗
+║             {Fore.GREEN}APG Builder {VERSION}{Fore.CYAN}             ║
+║      {Fore.WHITE}Create and validate APG packages{Fore.CYAN}      ║
+╚══════════════════════════════════════════╝{Style.RESET_ALL}
+"""
 
-class APGValidationError(APGError):
-    """Ошибки валидации"""
-    pass
+class Colors:
+    """Color constants for formatted output"""
+    INFO = Fore.BLUE
+    SUCCESS = Fore.GREEN
+    WARNING = Fore.YELLOW
+    ERROR = Fore.RED
+    HEADER = Fore.CYAN
+    BOLD = Style.BRIGHT
+    DIM = Style.DIM
+    RESET = Style.RESET_ALL
 
 class APGBuilder:
-    """Основной класс для сборки APG пакетов"""
-    
-    REQUIRED_FILES = {
-        "metadata.json": {
-            "required": True,
-            "validate": True,
-            "required_fields": ["name", "version", "release", "architecture"]
+    REQUIRED_STRUCTURE = {
+        'metadata.json': {
+            'required': True,
+            'type': 'file',
+            'description': 'Package metadata and information'
         },
-        "manifest.json": {
-            "required": True,
-            "validate": True,
-            "required_fields": ["files", "scripts"]
+        'manifest.json': {
+            'required': True,
+            'type': 'file',
+            'description': 'Package manifest configuration'
         },
-        "scripts/preinstall": {"required": True, "executable": True},
-        "scripts/postinstall": {"required": True, "executable": True},
-        "scripts/preremove": {"required": True, "executable": True},
-        "scripts/postremove": {"required": True, "executable": True},
-        "data": {"required": True, "is_dir": True},
-        "checksums.json": {"required": True, "validate": True}
+        'scripts/preinstall': {
+            'required': True,
+            'type': 'file',
+            'description': 'Pre-installation script'
+        },
+        'scripts/postinstall': {
+            'required': True,
+            'type': 'file',
+            'description': 'Post-installation script'
+        },
+        'scripts/preremove': {
+            'required': True,
+            'type': 'file',
+            'description': 'Pre-removal script'
+        },
+        'scripts/postremove': {
+            'required': True,
+            'type': 'file',
+            'description': 'Post-removal script'
+        },
+        'data': {
+            'required': True,
+            'type': 'directory',
+            'description': 'Package data directory'
+        },
+        'checksums.json': {
+            'required': True,
+            'type': 'file',
+            'description': 'File checksums and integrity data'
+        }
     }
 
-    def __init__(self, source_dir: Union[str, Path], output_dir: Optional[Union[str, Path]] = None,
-                 compression: str = 'zstd', level: int = 19, verbose: bool = False):
-        self.source_dir = Path(source_dir).resolve()
-        self.output_dir = Path(output_dir) if output_dir else self.source_dir
-        self.compression = compression
-        self.level = level
+    def __init__(self, directory: str, output_name: str, verbose: bool = False):
+        self.directory = Path(directory).resolve()
+        self.output_name = output_name
         self.verbose = verbose
-        self.metadata = {}
+        self.temp_tar = "temp_archive.tar.xz"
+        self.start_time = datetime.now()
 
-    def _log(self, message: str, level: str = 'info') -> None:
-        """Логирование с учетом уровня verbose"""
-        if self.verbose or level != 'info':
-            getattr(logger, level)(message)
+    def log(self, level: str, message: str):
+        """Universal logging method"""
+        colors = {
+            'INFO': Colors.INFO,
+            'SUCCESS': Colors.SUCCESS,
+            'WARNING': Colors.WARNING,
+            'ERROR': Colors.ERROR
+        }
+        if level == 'INFO' and not self.verbose:
+            return
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        print(f"{Colors.DIM}[{timestamp}]{Colors.RESET} {colors.get(level)}[{level}]{Colors.RESET} {message}")
 
-    def _validate_json_file(self, file_path: Path, required_fields: List[str] = None) -> None:
-        """Проверка JSON файла и его обязательных полей"""
-        try:
-            with open(file_path) as f:
-                data = json.load(f)
-                if required_fields:
-                    missing = [field for field in required_fields if field not in data]
-                    if missing:
-                        raise APGValidationError(
-                            f"Отсутствуют обязательные поля в {file_path.name}: {', '.join(missing)}"
-                        )
-                return data
-        except json.JSONDecodeError:
-            raise APGValidationError(f"Некорректный JSON файл: {file_path}")
-        except FileNotFoundError:
-            raise APGValidationError(f"Файл не найден: {file_path}")
-
-    def _validate_structure(self) -> None:
-        """Проверка структуры пакета"""
-        errors = []
+    def validate_structure(self) -> bool:
+        """Validate the directory structure"""
+        self.log('INFO', f"Validating directory structure in: {self.directory}")
+        is_valid = True
+        missing_items = []
         
-        for path, config in self.REQUIRED_FILES.items():
-            full_path = self.source_dir / path
-            
-            # Проверка существования
+        for path, config in self.REQUIRED_STRUCTURE.items():
+            full_path = self.directory / path
             if not full_path.exists():
-                if config["required"]:
-                    errors.append(f"Отсутствует обязательный компонент: {path}")
-                continue
-                
-            # Проверка на директорию
-            if config.get("is_dir") and not full_path.is_dir():
-                errors.append(f"Должен быть директорией: {path}")
-                
-            # Проверка на исполняемость
-            if config.get("executable") and not os.access(full_path, os.X_OK):
-                errors.append(f"Файл должен быть исполняемым: {path}")
-                
-            # Валидация JSON
-            if config.get("validate"):
-                try:
-                    data = self._validate_json_file(
-                        full_path, 
-                        config.get("required_fields", [])
-                    )
-                    if path == "metadata.json":
-                        self.metadata = data
-                except APGValidationError as e:
-                    errors.append(str(e))
-                    
-        if errors:
-            raise APGValidationError("\n".join(errors))
+                missing_items.append((path, config['description']))
+                is_valid = False
+            else:
+                if config['type'] == 'file' and not full_path.is_file():
+                    self.log('ERROR', f"{path} should be a file")
+                    is_valid = False
+                elif config['type'] == 'directory' and not full_path.is_dir():
+                    self.log('ERROR', f"{path} should be a directory")
+                    is_valid = False
+                else:
+                    self.log('INFO', f"✓ Found {path}")
 
-    def _update_checksums(self) -> None:
-        """Обновление контрольных сумм"""
-        checksums = {}
-        
-        for root, _, files in os.walk(self.source_dir):
-            for file in files:
-                if file != "checksums.json":
-                    file_path = Path(root) / file
-                    rel_path = file_path.relative_to(self.source_dir)
-                    
-                    with open(file_path, "rb") as f:
-                        checksums[str(rel_path)] = {
-                            "sha256": hashlib.sha256(f.read()).hexdigest(),
-                            "updated": datetime.utcnow().isoformat()
-                        }
-        
-        with open(self.source_dir / "checksums.json", "w") as f:
-            json.dump(
-                {
-                    "checksums": checksums,
-                    "updated": datetime.utcnow().isoformat(),
-                    "generator": "apgbuild-1.0.0"
-                },
-                f, 
-                indent=2
-            )
+        if missing_items:
+            print(f"\n{Colors.ERROR}Missing required components:{Colors.RESET}")
+            for item, desc in missing_items:
+                print(f"{Colors.BOLD}  • {item}{Colors.RESET}")
+                print(f"    {Colors.DIM}{desc}{Colors.RESET}")
 
-    def _get_package_name(self) -> str:
-        """Формирование имени пакета"""
-        return (f"{self.metadata['name']}-{self.metadata['version']}-"
-                f"{self.metadata['release']}-{self.metadata['architecture']}")
+        return is_valid
 
-    def build(self) -> Path:
-        """Сборка пакета"""
+    def create_archive(self) -> bool:
+        """Create the APG archive"""
         try:
-            # Проверка структуры
-            self._log("Проверка структуры пакета...")
-            self._validate_structure()
+            self.log('INFO', f"Creating archive from {self.directory}")
             
-            # Обновление контрольных сумм
-            self._log("Обновление контрольных сумм...")
-            self._update_checksums()
-            
-            # Формирование имени пакета
-            package_name = self._get_package_name()
-            ata_file = self.output_dir / f"{package_name}.ata"
-            apg_file = self.output_dir / f"{package_name}.apg"
-            
-            # Создание архива
-            self._log(f"Создание архива {ata_file}...")
-            archive = ATAArchive(
-                str(ata_file),
-                compression=self.compression,
-                level=self.level,
-                verbose=self.verbose
-            )
-            
-            # Добавление файлов в архив
-            archive.create([str(self.source_dir / item) for item in os.listdir(self.source_dir)])
-            
-            # Переименование в .apg
-            self._log(f"Переименование в {apg_file}...")
-            ata_file.rename(apg_file)
-            
-            self._log(f"Пакет успешно собран: {apg_file}")
-            return apg_file
-            
-        except APGValidationError as e:
-            self._log(f"Ошибка валидации:\n{e}", "error")
-            raise
+            # Create tar.xz archive with progress indicator
+            with tarfile.open(self.temp_tar, "w:xz") as tar:
+                total_files = sum(len(files) for _, _, files in os.walk(self.directory))
+                processed_files = 0
+                
+                for root, _, files in os.walk(self.directory):
+                    for file in files:
+                        full_path = Path(root) / file
+                        rel_path = full_path.relative_to(self.directory)
+                        tar.add(full_path, arcname=str(rel_path))
+                        processed_files += 1
+                        if self.verbose:
+                            progress = (processed_files / total_files) * 100
+                            print(f"\rProgress: {progress:.1f}% [{processed_files}/{total_files}]", end='')
+                
+                if self.verbose:
+                    print()  # New line after progress
+
+            # Rename to .apg
+            if os.path.exists(self.output_name):
+                os.remove(self.output_name)
+            os.rename(self.temp_tar, self.output_name)
+
+            package_size = Path(self.output_name).stat().st_size / (1024 * 1024)  # Size in MB
+            self.log('SUCCESS', f"Created package: {self.output_name} ({package_size:.2f} MB)")
+            return True
+
         except Exception as e:
-            self._log(f"Неожиданная ошибка: {e}", "error")
-            raise APGError(f"Ошибка сборки: {e}")
+            self.log('ERROR', f"Failed to create archive: {str(e)}")
+            if os.path.exists(self.temp_tar):
+                os.remove(self.temp_tar)
+            return False
 
-@click.command()
-@click.argument('source_dir', type=click.Path(exists=True, file_okay=False, dir_okay=True))
-@click.option('--output-dir', '-o', type=click.Path(file_okay=False, dir_okay=True),
-              help='Директория для сохранения пакета')
-@click.option('--compression', '-c', type=click.Choice(['zstd', 'none']),
-              default='zstd', help='Метод сжатия')
-@click.option('--level', '-l', type=click.IntRange(1, 19),
-              default=19, help='Уровень сжатия (1-19)')
-@click.option('--verbose', '-v', is_flag=True, help='Подробный вывод')
-def main(source_dir: str, output_dir: str, compression: str, level: int, verbose: bool):
-    """Утилита для сборки APG пакетов
+def show_structure_help():
+    """Display help about required package structure"""
+    print(f"\n{Colors.HEADER}Required Package Structure:{Colors.RESET}")
+    print("""
+package.apg/
+├── metadata.json      # Package metadata
+├── manifest.json      # Package manifest
+├── scripts/          
+│   ├── preinstall    # Pre-installation script
+│   ├── postinstall   # Post-installation script
+│   ├── preremove     # Pre-removal script
+│   └── postremove    # Post-removal script
+├── data/             # Package data directory
+└── checksums.json    # File checksums
+""")
 
-    SOURCE_DIR - директория с исходными файлами пакета
-    """
-    try:
-        builder = APGBuilder(
-            source_dir,
-            output_dir,
-            compression=compression,
-            level=level,
-            verbose=verbose
-        )
-        builder.build()
-        
-    except (APGError, Exception) as e:
-        click.echo(f"Ошибка: {e}", err=True)
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"{Colors.HEADER}APG Package Builder{Colors.RESET}\n" +
+                   f"{Colors.DIM}Tool for creating and validating APG packages{Colors.RESET}",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--name', required=True, help='Output APG file name')
+    parser.add_argument('--dir', required=True, help='Source directory path')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
+    parser.add_argument('--structure', action='store_true', help='Show required package structure')
+    parser.add_argument('--version', action='version', 
+                       version=f'%(prog)s {VERSION}',
+                       help='Show program version')
+
+    args = parser.parse_args()
+
+    if args.structure:
+        show_structure_help()
+        sys.exit(0)
+
+    print(BANNER)
+
+    # Validate input
+    if not args.name.endswith('.apg'):
+        args.name += '.apg'
+
+    if not os.path.isdir(args.dir):
+        print(f"{Colors.ERROR}Error: Directory not found: {args.dir}{Colors.RESET}")
         sys.exit(1)
 
-if __name__ == '__main__':
-    main()
+    # Create builder instance
+    builder = APGBuilder(args.dir, args.name, args.verbose)
+
+    # Validate structure and create archive
+    if builder.validate_structure():
+        if builder.create_archive():
+            duration = datetime.now() - builder.start_time
+            print(f"\n{Colors.SUCCESS}Package built successfully!{Colors.RESET}")
+            print(f"{Colors.DIM}Time elapsed: {duration.total_seconds():.2f} seconds{Colors.RESET}")
+            sys.exit(0)
+    
+    sys.exit(1)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.WARNING}Operation cancelled by user{Colors.RESET}")
+        sys.exit(1)
